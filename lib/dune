@@ -2,4 +2,4 @@
  (modules core formatter)
  (name rex)
  (public_name rex)
- (libraries libtorch))
+ (libraries torch random base))
