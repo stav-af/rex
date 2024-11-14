@@ -1,10 +1,12 @@
 open Formatter
+open Partition
+
 open Torch
 
 type partition_range = (int*int) list
 
 
-let data = [0;2;2;2;2;2;2;2;2;2;2;2]
+let data = [2;0;2;2;2;2;2;2;2;2;2;2]
 let importance = ref (Array.make (List.length data) 0.0)
 let occlusion_value = 1
   
@@ -25,9 +27,9 @@ let minimum_by cmp lst =
 
 let min_by metric_func lst =
   match lst with
-  | [] -> failwith "Empty list"
-  | hd :: tl ->
-      List.fold_left (fun acc x -> if metric_func x < metric_func acc then x else acc) hd tl
+  | [] -> None
+  | hd :: tl -> Some (
+      List.fold_left (fun acc x -> if metric_func x < metric_func acc then x else acc) hd tl)
 
 let rec power_set lst =
   match lst with
@@ -36,9 +38,18 @@ let rec power_set lst =
       let rest = power_set xs in
       rest @ List.map (fun subset -> x :: subset) rest
 
-let combinations_012 =
-  let all_subsets = power_set [0; 1] in
-  List.filter (fun subset -> List.length subset > 0) all_subsets
+let rec unfold_right f init =
+    match f init with
+    | None -> []
+    | Some (x, next) -> x :: unfold_right f next
+
+let range n =
+    let irange x = if x > n then None else Some (x, x + 1) in
+    unfold_right irange 1
+
+let combinations_n n_partitions =
+  let all_subsets = power_set (List.init n_partitions Fun.id) in
+  List.filter (fun subset -> let l = List.length subset in l > 0) all_subsets
 
 
 let get_indices source index_lists =
@@ -89,59 +100,69 @@ let diffm partition cst_set =
           are_lists_equal (partition::ranges) oth_range
       ) cst_set )
     ) shown_part in
-    match minimum_by cmp_by_length subj with
-    | Some min_ocl ->
-      let (min_ranges, _) = min_ocl in
-      List.length min_ranges
-    | None -> 1
-    
+    let mmut = min_by (fun (r, _) -> List.length r) subj in
+    let value = match mmut with
+    | Some (r, _) -> List.length r
+    | None -> (match subj with 
+      | (r, _)::[] -> List.length r
+      | [] -> 0
+      | _ -> failwith "Don't know how on earth we got here") in
+    (* Printf.printf "Found value to be %d for the partition" value;
+    pp_mutants subj; *)
+    value
 
-let forward model data = (* will need to incorporate pytorch models here later *)
+
+let forward model data = 
   let float_data = data |> Array.of_list |> Array.map float_of_int in
   let tens = Tensor.of_float1 float_data in
   let raw =(Module.forward model [tens]) in
   let pred = stable_softmax raw in
   let activ = Tensor.argmax pred ~dim:0  in
-  let result = match Tensor.to_float0 activ with
+  match Tensor.to_float0 activ with
   | Some x -> int_of_float x
+  | None -> failwith "conversin failed"
 
-  | None -> failwith "conversin failed" in
-  result
-
-let apply_diff range value refinement_depth =
+  
+let apply_diff range value =
   List.iter (fun (start_idx, end_idx) ->
-    for i = start_idx to end_idx - 1 do
-      !importance.(i) <- (!importance.(i) +. (1.0/.(1.0+.(float_of_int value)))/. (float_of_int refinement_depth)  )
+    for i = start_idx to end_idx do
+      !importance.(i) <- (!importance.(i) +. (1.0/.(1.0+.(float_of_int value)))  )
     done
   ) range
 
 let test() =
-  let model = Module.load "/home/stav/dev/uni/xai/rsandbox/rex/models/xor_and_xor.pt" in
-  let occlusion_idx_combinations = List.filter (
-    fun l -> List.length l < 2
-  ) combinations_012 in
+  let model = Module.load "/home/stav/dev/uni/xai/rsandbox/rex/models/xor.pt" in
+  let init_partitions = 6 in 
+  
   let plb = 0 in
   let pub = 12 in
-  let rec refine lower upper depth = 
-    if upper != lower then
+  let refine lower upper n_partitions = 
+    if upper != lower && n_partitions > 1 then
       let initial_prediction = forward model data in
-      let partitions = gen_partition lower upper in
-      let partition_occlusion_combinations = get_indices partitions occlusion_idx_combinations in 
+      
+      let partitions = partition !importance lower upper n_partitions in
+      let occlusion_idx_combinations = combinations_n n_partitions in   
+     
+      let partition_occlusion_combinations = get_indices partitions occlusion_idx_combinations in  
       let mutants = gen_mutants data partition_occlusion_combinations in
+
       let consistent_set = List.filter (fun (_, mut) -> forward model mut = initial_prediction) mutants in
-      pretty_print_lf (Array.to_list !importance);
-      let important = List.filter (
-        fun (lb, ub) -> (diffm (lb, ub) consistent_set) = 0) partitions in
-      Printf.printf "Range: (%d, %d)\n Important part: " lower upper;
-      pp_partition_range important;
-      print_endline "";
       List.iter (
-        fun (lb, ub) -> apply_diff [(lb, ub)] (diffm (lb, ub) consistent_set) depth
-      ) important;
-      pp_partition_range partitions;
+        fun (lb, ub) -> apply_diff [(lb, ub)] (diffm (lb, ub) consistent_set)
+      ) partitions;
+      ()
+      (* let important = List.filter (
+        fun (lb, ub) -> (diffm (lb, ub) consistent_set) < (n_partitions / 2)) partitions in
       let important = List.filter (fun (lb, ub) -> lb != lower || ub != upper) important in
-     (List.iter (fun (l, u) -> refine l u (depth + 1) ) important)
-    else
-      () in
-  refine plb pub 1
+
+      let next = List.filter ( fun (lo, up) -> (up - lo) > 2) important in
+      (List.iter (fun (l, u) -> refine l u (Random.int() ~max:(u - l)) ) next) *)
+      else
+        () in
+    
+  while true do
+    refine plb pub init_partitions;
+    pretty_print_lf (Array.to_list !importance);
+    print_endline ""
+  done
   

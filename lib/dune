@@ -1,5 +1,5 @@
 (library
- (modules core formatter)
+ (modules core formatter partition)
  (name rex)
  (public_name rex)
  (libraries torch random base))
