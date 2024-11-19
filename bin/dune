@@ -1,4 +1,4 @@
 (executable
  (public_name rex)
  (name main)
- (libraries rex))
+ (libraries rex torch pyml))

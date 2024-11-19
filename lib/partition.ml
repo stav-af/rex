@@ -5,13 +5,16 @@ let partition distribution start_idx end_idx n_partitions=
   let rec generate_partition_sizes n remaining start n_partitions acc =
     if remaining = 0 || n = n_partitions then List.rev acc
     else
+      let part_size = (end_idx - start_idx) in
+      let avg_part_size = part_size / n_partitions in
+
       let weight = distribution.(start_idx) in
       let weight_ratio = weight /. total_weight in
       
       let size =
         if Random.float() ~max:1.0 < weight_ratio 
-          then (Random.int() ~max:1)
-          else max 1 (Random.int() ~max:3)
+          then (Random.int() ~max:avg_part_size)
+          else max 1 (Random.int() ~max:(part_size / 2))
       in
 
       if size <= remaining then
@@ -25,8 +28,9 @@ let partition distribution start_idx end_idx n_partitions=
   let rec sizes_to_bounds sizes start acc =
     match sizes with
     | [] -> (match acc with
-      | (_, n)::_ when n = (end_idx - 1) -> List.rev acc
-      | (_, n)::_                  -> List.rev ((n, end_idx - 1)::acc)
+      | (l, u)::rest when l > end_idx || u > end_idx -> List.rev rest
+      | (_, n)::_ when n = end_idx -> List.rev acc
+      | (_, n)::_                  -> List.rev ((n, end_idx)::acc)
       | [] -> failwith "No partitions generated")
     | size :: rest ->
       let end_index = start + size in
