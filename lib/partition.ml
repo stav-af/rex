@@ -1,41 +1,72 @@
+(* open Formatter *)
+open Utils
+
+open List
 
 
-let partition distribution start_idx end_idx n_partitions=
-  let total_weight = Array.fold_left ( +. ) 0. distribution in
-  let rec generate_partition_sizes n remaining start n_partitions acc =
-    if remaining = 0 || n = n_partitions then List.rev acc
+let rec cdf_tail arr acc = 
+  let lst = if length acc = 0 then 0. else hd acc in
+  match arr with
+  | [] -> rev acc
+  | x::xs -> cdf_tail xs (lst+.x::acc)
+
+let cdf arr = 
+  cdf_tail arr []
+
+let norm arr = 
+  let sum = fold_left (+.) 0. arr in
+  if sum = 0. then 
+    let n = length arr in
+    init n (fun _ -> 1./.(float_of_int n))
+  else
+      map (fun x -> x /. sum) arr
+
+let find_index f lst =
+  let rec aux i = function
+    | [] -> None
+    | x :: xs -> if f x then Some i else aux (i + 1) xs
+  in
+  aux 0 lst
+
+let partition responsibility choices n_parts = 
+  let nonzero_resp = 
+    if for_all (fun x -> x = 0.) responsibility then
+      init (length responsibility) (fun _ -> 1./.(float_of_int (length responsibility)))
     else
-      let part_size = (end_idx - start_idx) in
-      let avg_part_size = part_size / n_partitions in
+      responsibility
+    in
 
-      let weight = distribution.(start_idx) in
-      let weight_ratio = weight /. total_weight in
-      
-      let size =
-        if Random.float() ~max:1.0 < weight_ratio 
-          then (Random.int() ~max:avg_part_size)
-          else max 1 (Random.int() ~max:(part_size / 2))
-      in
+  
+  let rec aux acc curr score used = 
 
-      if size <= remaining then
-        if size = 0 then generate_partition_sizes n remaining start n_partitions acc
-        else generate_partition_sizes (n + 1) (remaining - size) (start + size) n_partitions (size :: acc)
-      else List.rev (remaining::acc)
-  in
+    let resp_options = mapi (fun i x -> if (mem i choices && not (mem i used))then x else 0.) nonzero_resp in
+    let steps = cdf (norm resp_options) in 
+    let avg_resp = 1. /. float_of_int (length resp_options) in   
 
-  let partition_sizes = generate_partition_sizes 0 end_idx start_idx n_partitions [] in
+    if are_lists_equal used choices 
+      || length acc = n_parts 
+      || for_all (fun x -> x = 0.) resp_options
+    then acc else
+    
+    let rand = Random.float() ~max:1. in
+    let curr_choice = 
+      match find_index (fun x -> x > rand) steps with
+      | Some x -> x
+      | _ -> failwith "shoudln't really be here" in
 
-  let rec sizes_to_bounds sizes start acc =
-    match sizes with
-    | [] -> (match acc with
-      | (l, u)::rest when l > end_idx || u > end_idx -> List.rev rest
-      | (_, n)::_ when n = end_idx -> List.rev acc
-      | (_, n)::_                  -> List.rev ((n, end_idx)::acc)
-      | [] -> failwith "No partitions generated")
-    | size :: rest ->
-      let end_index = start + size in
-      sizes_to_bounds rest end_index ((start, end_index) :: acc)
-  in
+    let curr_resp = nth resp_options curr_choice in
 
-  let partitions = sizes_to_bounds partition_sizes start_idx [] in
-  partitions
+    let next_partition = curr_choice::curr in
+    let next_score = score +. curr_resp in
+    
+    if next_score > avg_resp then
+      aux (next_partition::acc) [] 0. (curr_choice::used)
+    else
+      aux acc next_partition next_score (curr_choice::used)
+    in
+  aux [] [] 0. []
+    
+    
+
+
+

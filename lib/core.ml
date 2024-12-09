@@ -1,11 +1,10 @@
 (* open Formatter *)
 open Partition
+open Utils
 
 open Torch
 
-type partition_range = (int*int) list
-
-let importance = ref (Array.make 12 0.0)
+let importance = ref (Array.make 12 1.)
 let occlusion_value = 1
 
 let t_stable_softmax logits =
@@ -22,21 +21,6 @@ let f_stable_softmax (logits: float array) : float array =
   let sum_exp = Array.fold_left (+.) 0.0 exp_logits in
   Array.map (fun x -> x /. sum_exp) exp_logits
 
-let max_by metric_func lst =
-  match lst with
-  | [] -> None
-  | hd :: tl -> Some (
-      List.fold_left (fun acc x -> if metric_func x > metric_func acc then x else acc) hd tl)
-
-
-let rec power_set lst =
-  match lst with
-  | [] -> [[]]
-  | x :: xs ->
-      let rest = power_set xs in
-      rest @ List.map (fun subset -> x :: subset) rest
-
-
 let rec unfold_right f init =
     match f init with
     | None -> []
@@ -44,66 +28,38 @@ let rec unfold_right f init =
 
 
 let range n =
-    let irange x = if x > n then None else Some (x, x + 1) in
-    unfold_right irange 1
+    let irange x = if x >= n then None else Some (x, x + 1) in
+    unfold_right irange 0
 
 
 let combinations_n n_partitions =
   let all_subsets = power_set (List.init (n_partitions) Fun.id) in
-  List.filter (fun subset -> let l = List.length subset in l > 0  &&
+  List.filter (fun subset -> let l = List.length subset in l > 0 &&
                                 l < n_partitions) all_subsets
 
 
-let get_indices source index_lists =
-  List.map (fun index_list ->
-    List.map (fun idx -> List.nth source idx) index_list
-  ) index_lists
-
-
-let occlude (data: int list) (partitions: partition_range) = 
+let occlude data partitions = 
   List.mapi ( fun i x_i -> 
     if List.exists (
-      fun (lb, ub) -> (i >= lb) && (i < ub)
+      fun p_list -> List.mem i p_list
     ) partitions then 
     occlusion_value else x_i
   ) data
 
 
-let gen_mutants (data) (partition_combinations: partition_range list) =
+let get_indices partitions index_combinations = 
+  List.map (
+    fun idx_combo ->
+      List.filteri (
+        fun i _ -> List.mem i idx_combo
+      ) partitions
+  ) index_combinations
+
+
+let gen_mutants data partition_combinations =
   List.map (fun partition ->
     (partition, occlude data partition)
   ) partition_combinations
-
-
-let cmp_by_length (ranges1, _) (ranges2, _) =
-    compare (List.length ranges1) (List.length ranges2)
-
-
-let compare_ranges (a1, b1) (a2, b2) =
-  match compare a1 a2 with
-  | 0 -> compare b1 b2
-  | c -> c
-
-
-let sort_ranges ranges =
-  List.sort compare_ranges ranges
-
-
-let are_lists_equal lst1 lst2 =
-  let sorted_lst1 = sort_ranges lst1 in
-  let sorted_lst2 = sort_ranges lst2 in
-  sorted_lst1 = sorted_lst2
-
-
-let diffm cst_set partition= 
-  let shown_part = List.filter (fun (ranges, _) -> not (List.mem partition ranges)) cst_set in
-  let max_mut = max_by (fun (r, _) -> List.length r) shown_part in
-
-  match max_mut with
-    | Some (r, _) -> List.length r
-    | None -> (match shown_part with 
-      | (r, _)::[] -> List.length r
-      | _ -> 0)
 
 
 let forward model data = 
@@ -116,71 +72,79 @@ let forward model data =
   | Some x -> int_of_float x
   | None -> failwith "conversion failed"
 
-  
-let apply_diff range occluded_partitions total_partions =
-  let (start_idx, end_idx) = range in 
-  let f_partition_size = float_of_int (end_idx - start_idx) in
-  
-  let f_occluded_partitions = float_of_int occluded_partitions in
-  let f_total_partitions = float_of_int total_partions in
+    
+let unique l =
+  let rec aux l acc =
+    match l with
+    | [] ->
+      acc
+    | h :: t ->
+      if List.mem h acc then aux t acc else aux t (h :: acc)
+  in aux l [] 
 
-  let f_partition_responsibility = 1. /. (f_total_partitions -. f_occluded_partitions) in
-  let f_split_responsibility = f_partition_responsibility /. f_partition_size in
 
-  (* Printf.printf "Range (%d, %d) has resp: %f\n" start_idx end_idx f_split_responsibility; *)
-  for i = start_idx to end_idx - 1 do
-    (* Printf.printf "Applying split to %d\n" i; *)
-    !importance.(i) <- !importance.(i) +. f_split_responsibility
+let assign_responsibility part responsibility =
+  let resp_distributed = responsibility /. (float (List.length part)) in
+  for i = 0 to 12 do 
+    if List.mem i part then
+      !importance.(i) <- resp_distributed
+    else ()
   done
+    
 
-let rec take n lst =
-    match (n, lst) with
-    | (0, _) -> []
-    | (_, []) -> []
-    | (n, x :: xs) -> x :: take (n - 1) xs
+let responsibility part consistent_set = 
+  let consistent_with_partition = 
+    List.filter (fun mut -> not (List.mem part mut)) consistent_set 
+  in 
 
+  let adding_part_changes_prediction = 
+    List.filter (fun mut -> 
+      not (List.exists 
+      (fun consistent -> are_lists_equal consistent (part :: mut)) consistent_set)
+    ) consistent_with_partition 
+  in
 
-let rex model data =
+  match adding_part_changes_prediction with
+  | [] -> 0.0  (* If no such mutants, responsibility is 0 *)
+  | _ ->
+    let min_mutant = min_by List.length adding_part_changes_prediction in
+    let minpart = List.length min_mutant in
+    1. /. (float minpart)
+
+let rex model data = 
   let init_partitions = 6 in 
-  importance := Array.make (List.length data) 0.0;
-  
-  let plb = 0 in
-  let pub = 12 in
-  let rec refine lower upper max_partitions depth = 
-    let initial_prediction = forward model data in
+  importance := Array.make (List.length data) 0.;
+  let max_depth = 1 in
+  let initial_prediction = forward model data in
+  let refine choices max_partitions depth = 
+    if depth >= max_depth || List.length choices < max_partitions then () else
+    let importance_lst = Array.to_list !importance in
 
-    let partitions = partition !importance lower upper max_partitions in
+    let partitions = partition importance_lst choices max_partitions in
     let n_partitions = List.length partitions in
-
     let occlusion_idx_combinations = combinations_n n_partitions in   
     
     let partition_occlusion_combinations = get_indices partitions occlusion_idx_combinations in  
     let mutants = gen_mutants data partition_occlusion_combinations in
 
     let consistent_set = List.filter (fun (_, mut) -> forward model mut = initial_prediction) mutants in
-    let curr_diffm = diffm consistent_set in
+    let consistent_set_occlusions = List.map (fun (indices, _) -> indices) consistent_set in
 
-    List.iter (
-      fun subject_partition -> 
-        apply_diff 
-          subject_partition 
-          (curr_diffm subject_partition) 
-          (List.length partitions)
-    ) partitions;
+    if List.length consistent_set_occlusions != 0 then
+    List.iter (fun partition -> 
+        let resp = responsibility partition consistent_set_occlusions in
+        assign_responsibility partition resp
+      ) partitions
     
-    let k = n_partitions / 2 in
-    let sorted = List.sort (fun px py -> compare (curr_diffm py) (curr_diffm px)) partitions in
-      
-    let refine_subjects = List.filter(fun (lb, ub) -> ub - lb > 2) (take k sorted) in
-    List.iter (
-        fun (lb, ub) -> refine lb ub ((ub - lb - 1) / 2) (depth + 1)
-    ) refine_subjects
   in
-  
-  let () = for _ = 0 to 10 do
-    refine plb pub init_partitions 0;
-  done in
-  (* pretty_print_lf (Array.to_list !importance); *)
-  !importance
 
-  
+    (* List.iter
+    (
+      fun partition ->
+        refine partition max_partitions (depth + 1)
+    ) to_search; () in *)
+
+  let () = for _ = 0 to 5 do
+    refine (range 12) init_partitions 0;
+  done in
+  !importance
